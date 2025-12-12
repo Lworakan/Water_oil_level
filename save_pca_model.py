@@ -10,26 +10,21 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 import pickle
 
-# Load the cleaned data
-print("Loading data from target_combined_ir_data_cleaned.csv...")
-df = pd.read_csv('target_combined_ir_data_cleaned.csv')
+# Load the cleaned data (after multicollinearity removal)
+print("Loading data from Oil_Quality_Dataset_2025/cleaned_data_no_multicollinearity.csv...")
+df = pd.read_csv('Oil_Quality_Dataset_2025/cleaned_data_no_multicollinearity.csv')
 
-# Define feature columns (30 features)
+# Define feature columns (12 features after multicollinearity removal)
 feature_columns = [
-    'depth_mean', 'depth_std', 'depth_min', 'depth_max',
-    'color_R_mean', 'color_R_std', 'color_G_mean', 'color_G_std',
-    'color_B_mean', 'color_B_std',
-    'color_H_mean', 'color_H_std', 'color_S_mean', 'color_S_std',
-    'color_V_mean', 'color_V_std',
-    'texture_entropy', 'texture_contrast',
-    'ir_mean', 'ir_std', 'ir_min', 'ir_max',
-    'color_R_min', 'color_R_max', 'color_G_min', 'color_G_max',
-    'color_B_min', 'color_B_max', 'color_H_min', 'color_H_max'
+    'color_bbox_mean_r', 'color_bbox_mean_g', 'color_poly_mean_b',
+    'color_poly_std_b', 'hsv_bbox_mean_h', 'hsv_bbox_mean_s',
+    'hsv_poly_mean_h', 'hsv_poly_mean_s', 'hsv_poly_mean_v',
+    'color_bbox_entropy', 'color_poly_entropy', 'ir_cluster'
 ]
 
 # Extract features
 X = df[feature_columns].values
-y = df['Oil_Type'].values
+y = df['level2_class'].values
 
 print(f"Data shape: {X.shape}")
 print(f"Number of classes: {len(np.unique(y))}")
