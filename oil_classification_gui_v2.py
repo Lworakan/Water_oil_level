@@ -131,6 +131,14 @@ class OilClassificationGUI:
         self.video_label = ttk.Label(left_frame)
         self.video_label.pack()
 
+        # Segmentation Prompt Selection
+        prompt_frame = ttk.Frame(left_frame)
+        prompt_frame.pack(pady=5)
+        ttk.Label(prompt_frame, text="Seg Prompt:").pack(side=tk.LEFT, padx=5)
+        self.segmentation_prompt = tk.StringVar(value="bottle")
+        ttk.Radiobutton(prompt_frame, text="Bottle (Split)", variable=self.segmentation_prompt, value="bottle").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(prompt_frame, text="Liquid (Whole)", variable=self.segmentation_prompt, value="Liquid").pack(side=tk.LEFT, padx=5)
+
         # Control buttons
         button_frame = ttk.Frame(left_frame)
         button_frame.pack(pady=10)
@@ -360,10 +368,14 @@ class OilClassificationGUI:
 
     def run_segmentation(self):
         if self.current_frame is None: return
-        self.update_status("Running auto-segmentation...")
+        
+        prompt = self.segmentation_prompt.get()
+        n_clusters = 1 if prompt == "Liquid" else 2
+        
+        self.update_status(f"Running auto-segmentation ({prompt})...")
         try:
             image_bgr = cv2.cvtColor(self.current_frame, cv2.COLOR_RGB2BGR)
-            self.auto_seg_results = self.auto_segmenter.process_frame(image_bgr, prompt="bottle", n_clusters=2)
+            self.auto_seg_results = self.auto_segmenter.process_frame(image_bgr, prompt=prompt, n_clusters=n_clusters)
             self.update_cluster_data()
             
             if self.auto_seg_results and self.auto_seg_results['segmentation_mask'] is not None:
@@ -373,9 +385,13 @@ class OilClassificationGUI:
                 a0 = np.sum(c0.get('mask', 0)) if c0.get('mask') is not None else 0
                 a1 = np.sum(c1.get('mask', 0)) if c1.get('mask') is not None else 0
                 
-                if a0 >= a1 and a0 > 0: sel, sel_name = c0, 'cluster_0'
-                elif a1 > 0: sel, sel_name = c1, 'cluster_1'
-                else: sel = None
+                if n_clusters == 1:
+                    # If only 1 cluster requested, use cluster_0
+                    sel, sel_name = c0, 'cluster_0'
+                else:
+                    if a0 >= a1 and a0 > 0: sel, sel_name = c0, 'cluster_0'
+                    elif a1 > 0: sel, sel_name = c1, 'cluster_1'
+                    else: sel = None
 
                 if sel and sel.get('mask') is not None:
                     self.segmentation_mask = sel['mask']
