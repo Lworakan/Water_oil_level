@@ -1,11 +1,6 @@
 """
-Oil Quality Classification GUI using SAM3 Segmentation and PCA Classification
-Features:
-- Automatic segmentation using SAM3
-- Real-time feature extraction (12 features)
-- PCA transformation & Classification
-- [NEW] Yellow Score Calculation (Min(R,G) - B)
-- [NEW] Black Score Calculation (Inverted Luminance)
+Enhanced Oil Quality Classification GUI with 2D/3D Classification
+Implements IR + Yellow + Black score thresholds for improved accuracy
 """
 
 import tkinter as tk
@@ -21,13 +16,28 @@ from auto_segmentation import AutoSegmenter
 # --- CONFIGURATION ---
 ROTATE_PREVIEW = True
 ROTATE_DIR = cv2.ROTATE_90_COUNTERCLOCKWISE
+MIN_CAPACITY_PIXELS = 20200  # Minimum pixels for capacity check
 
+class AutomationState:
+    """Track the automation sequence state"""
+    IDLE = "idle"
+    LIQUID_SEGMENT = "liquid_segment"
+    CLUSTER_CHECK = "cluster_check"
+    WAITING_IR_READ = "waiting_ir_read"
+    IR_DIFFERENCE_CHECK = "ir_difference_check"
+    SINGLE_LIQUID_MIDDLE = "single_liquid_middle"
+    WAITING_RGB_SINGLE = "waiting_rgb_single"
+    DUAL_LIQUID_CLUSTER1 = "dual_liquid_cluster1"
+    WAITING_RGB_CLUSTER1 = "waiting_rgb_cluster1"
+    DUAL_LIQUID_CLUSTER2 = "dual_liquid_cluster2"
+    WAITING_RGB_CLUSTER2 = "waiting_rgb_cluster2"
+    ANALYSIS_COMPLETE = "analysis_complete"
 
-class OilClassificationGUI:
+class OilClassificationEnhancedGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Oil Quality Classification System")
-        self.root.geometry("1200x900")
+        self.root.title("Enhanced Oil Quality Classification System (2D/3D)")
+        self.root.geometry("1600x1000")
 
         # Initialize variables
         self.current_frame = None
@@ -40,31 +50,79 @@ class OilClassificationGUI:
         
         # Custom Scores
         self.current_yellow_score = 0.0
-        self.current_black_score = 0.0  # [NEW]
+        self.current_black_score = 0.0
 
         # Auto-segmentation variables
         self.auto_seg_results = None
         self.current_clusters = {}
+        
+        # Automation state variables
+        self.automation_state = AutomationState.IDLE
+        self.cluster1_data = None
+        self.cluster2_data = None
+        self.ir_values = {}
+        self.rgb_values = {}
+        self.final_results = {}
 
-        # Manual BBox variables
-        self.manual_bbox_mode = False
-        self.drawing = False
-        self.start_x = 0
-        self.start_y = 0
-        self.temp_bbox = None
+        # Display variables
         self.display_scale = 1.0
 
-        # IR cluster thresholds for each oil type
-        self.ir_thresholds = {
-            'Water': 182.40,
-            'Mix (Oil+Water)': 181.01,
-            'Mix (Oil+Motor)': 47.12,
-            'Mix (Oil+Lard)': 91.52,
-            'Lard': 79.50,
-            'Motor oil': 47.16,
-            'Medium oil': 174.76,
-            'Light oil': 178.98,
-            'Dark oil': 141.84
+        # Enhanced 2D/3D thresholds for each oil type
+        self.oil_thresholds = {
+            'Water': {
+                'ir': 100.40,
+                'yellow': 2.0,      # Very low yellow (clear/transparent)
+                'black': 20.0       # Very low black (bright/light)
+            },
+            'Light oil': {
+                'ir':200.98,
+                'yellow': 98.0,     # Higher yellow (golden color)
+                'black': 126.0       # Lower black (lighter appearance)
+            },
+            'Medium oil': {
+                'ir': 145.0,
+                'yellow': 145.0,     # Medium yellow
+                'black': 89.0       # Medium black
+            },
+            'Dark oil': {
+                'ir': 111.0,
+                'yellow': 7.3,     # Lower yellow (less golden)
+                'black': 217.0      # High black (darker appearance)
+            },
+            'Motor oil': {
+                'ir': 49.0,
+                'yellow': 0.0,     # Low yellow
+                'black': 225.0      # High black (dark, viscous)
+            },
+            'Lard': {
+                'ir': 60.0,
+                'yellow': 20.0,     # Higher yellow (fatty, yellowish)
+                'black': 160.0       # Medium-low black (relatively light)
+            },
+            'Mix (Oil+Motor)': {
+                'ir': 47.12,
+                'yellow': 22.0,     # Low yellow
+                'black': 85.0       # High black
+            },
+            'Mix (Oil+Lard)': {
+                'ir': 91.52,
+                'yellow': 40.0,     # Medium yellow
+                'black': 55.0       # Medium black
+            }
+        }
+        
+        # Weights for distance calculation (adjust based on importance)
+        self.classification_weights = {
+            'ir': 1.0,
+            'yellow': 0.8,
+            'black': 0.8
+        }
+        
+        # Normalization factors for balanced distance calculation
+        self.normalization_factors = {
+            'ir': 200.0,        # Max expected IR range
+            'yellow': 100.0,    # Max expected yellow score
+            'black': 150.0      # Max expected black score
         }
 
         # Load PCA model
@@ -101,8 +159,8 @@ class OilClassificationGUI:
             print(f"✓ PCA model loaded: {len(self.centroids)} classes")
 
         except FileNotFoundError:
-            messagebox.showerror("Error", "PCA model file not found!")
-            self.root.quit()
+            print("⚠ PCA model file not found, using threshold-based classification only")
+            self.pca_mean = None
 
     def init_realsense(self):
         """Initialize Intel RealSense D435 camera"""
@@ -119,8 +177,67 @@ class OilClassificationGUI:
             print(f"✗ Camera initialization failed: {e}")
             return False
 
+    def calculate_3d_distance(self, ir_value, yellow_score, black_score, oil_type):
+        """Calculate normalized 3D distance to oil type thresholds"""
+        thresholds = self.oil_thresholds[oil_type]
+        
+        # Normalize each dimension
+        ir_diff = abs(ir_value - thresholds['ir']) / self.normalization_factors['ir']
+        yellow_diff = abs(yellow_score - thresholds['yellow']) / self.normalization_factors['yellow']
+        black_diff = abs(black_score - thresholds['black']) / self.normalization_factors['black']
+        
+        # Apply weights
+        weighted_ir = ir_diff * self.classification_weights['ir']
+        weighted_yellow = yellow_diff * self.classification_weights['yellow']
+        weighted_black = black_diff * self.classification_weights['black']
+        
+        # Calculate weighted Euclidean distance
+        distance = np.sqrt(weighted_ir**2 + weighted_yellow**2 + weighted_black**2)
+        
+        return distance
+
+    def classify_by_3d_thresholds(self, ir_value, yellow_score, black_score):
+        """Enhanced classification using 3D distance to thresholds"""
+        distances = {}
+        
+        # Calculate distance to each oil type
+        for oil_type in self.oil_thresholds.keys():
+            distance = self.calculate_3d_distance(ir_value, yellow_score, black_score, oil_type)
+            distances[oil_type] = distance
+        
+        # Find closest match
+        best_match = min(distances, key=distances.get)
+        confidence = 1.0 / (1.0 + distances[best_match])  # Convert distance to confidence
+        
+        # Calculate individual component distances for analysis
+        best_thresholds = self.oil_thresholds[best_match]
+        component_distances = {
+            'ir': abs(ir_value - best_thresholds['ir']),
+            'yellow': abs(yellow_score - best_thresholds['yellow']),
+            'black': abs(black_score - best_thresholds['black'])
+        }
+        
+        result = {
+            'class': best_match,
+            'confidence': confidence,
+            'total_distance': distances[best_match],
+            'all_distances': distances,
+            'component_distances': component_distances,
+            'usable': best_match in {'Light oil', 'Medium oil', 'Dark oil'},
+            'ir_value': ir_value,
+            'yellow_score': yellow_score,
+            'black_score': black_score,
+            'thresholds': best_thresholds
+        }
+        
+        return result
+
+    def classify_by_ir_and_rgb(self, ir_value, yellow_score, black_score):
+        """Main classification function using enhanced 3D approach"""
+        return self.classify_by_3d_thresholds(ir_value, yellow_score, black_score)
+
     def create_widgets(self):
-        """Create GUI widgets"""
+        """Create GUI widgets with enhanced display"""
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
@@ -131,111 +248,212 @@ class OilClassificationGUI:
         self.video_label = ttk.Label(left_frame)
         self.video_label.pack()
 
-        # Segmentation Prompt Selection
-        prompt_frame = ttk.Frame(left_frame)
-        prompt_frame.pack(pady=5)
-        ttk.Label(prompt_frame, text="Seg Prompt:").pack(side=tk.LEFT, padx=5)
-        self.segmentation_prompt = tk.StringVar(value="bottle")
-        ttk.Radiobutton(prompt_frame, text="Bottle (Split)", variable=self.segmentation_prompt, value="bottle").pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(prompt_frame, text="Liquid (Whole)", variable=self.segmentation_prompt, value="Liquid").pack(side=tk.LEFT, padx=5)
+        # Automation Control Panel
+        auto_frame = ttk.LabelFrame(left_frame, text="Automation Control", padding="10")
+        auto_frame.pack(pady=5, fill=tk.X)
 
-        # Control buttons
-        button_frame = ttk.Frame(left_frame)
-        button_frame.pack(pady=10)
+        # Start/Next button
+        self.action_button = ttk.Button(auto_frame, text="🚀 START ANALYSIS", 
+                                       command=self.handle_automation_step, 
+                                       style="Success.TButton")
+        self.action_button.pack(pady=5)
 
-        ttk.Button(button_frame, text="Auto Segment", command=self.run_segmentation).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Cluster Region", command=self.run_clustering_on_mask).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Middle 1/3 Mask", command=self.refine_mask_middle_third).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Manual BBox", command=self.toggle_manual_bbox).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Yellow Liquid Detect", command=self.detect_yellow_liquid, style="Warning.TButton").pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Load Image", command=self.load_image).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Take Snapshot", command=self.take_snapshot).pack(side=tk.LEFT, padx=5)
+        # Current step display
+        self.step_label = ttk.Label(auto_frame, text="Ready to start analysis", 
+                                   font=("Arial", 12, "bold"), foreground="blue")
+        self.step_label.pack(pady=5)
 
-        # Bind mouse events for manual bbox
-        self.video_label.bind("<ButtonPress-1>", self.on_mouse_down)
-        self.video_label.bind("<B1-Motion>", self.on_mouse_move)
-        self.video_label.bind("<ButtonRelease-1>", self.on_mouse_up)
+        # Reset button
+        ttk.Button(auto_frame, text="🔄 Reset", command=self.reset_automation).pack(pady=2)
 
-        # Cluster visibility
-        cluster_vis_frame = ttk.LabelFrame(left_frame, text="Cluster Display", padding="10")
-        cluster_vis_frame.pack(pady=5, fill=tk.X)
-
-        self.show_cluster_0 = tk.BooleanVar(value=True)
-        self.show_cluster_1 = tk.BooleanVar(value=True)
-
-        ttk.Checkbutton(cluster_vis_frame, text="Show Cluster 0 (Green)", variable=self.show_cluster_0).pack(anchor=tk.W)
-        ttk.Checkbutton(cluster_vis_frame, text="Show Cluster 1 (Magenta)", variable=self.show_cluster_1).pack(anchor=tk.W)
-
-        # Cluster selection
-        cluster_select_frame = ttk.LabelFrame(left_frame, text="Select Cluster for Classification", padding="10")
-        cluster_select_frame.pack(pady=5, fill=tk.X)
-
-        self.selected_cluster_for_classification = tk.StringVar(value="auto")
-
-        ttk.Radiobutton(cluster_select_frame, text="Auto (Larger Area)", variable=self.selected_cluster_for_classification, value="auto").pack(anchor=tk.W)
-        ttk.Radiobutton(cluster_select_frame, text="Cluster 0 (Green)", variable=self.selected_cluster_for_classification, value="cluster_0").pack(anchor=tk.W)
-        ttk.Radiobutton(cluster_select_frame, text="Cluster 1 (Magenta)", variable=self.selected_cluster_for_classification, value="cluster_1").pack(anchor=tk.W)
-
-        self.cluster_0_info = ttk.Label(cluster_select_frame, text="Cluster 0: N/A", font=("Consolas", 9), foreground="green")
-        self.cluster_0_info.pack(anchor=tk.W, pady=(5,0))
-        self.cluster_1_info = ttk.Label(cluster_select_frame, text="Cluster 1: N/A", font=("Consolas", 9), foreground="purple")
-        self.cluster_1_info.pack(anchor=tk.W)
-
-        # Method selection
+        # Classification Method Display
         method_frame = ttk.LabelFrame(left_frame, text="Classification Method", padding="10")
         method_frame.pack(pady=5, fill=tk.X)
+        
+        method_label = ttk.Label(method_frame, text="Enhanced 3D Classification\n(IR + Yellow + Black)", 
+                               font=("Arial", 10, "bold"), foreground="green")
+        method_label.pack()
 
-        self.classification_method = tk.StringVar(value="ir")
-        ttk.Radiobutton(method_frame, text="IR Cluster (Recommended)", variable=self.classification_method, value="ir").pack(anchor=tk.W)
-        ttk.Radiobutton(method_frame, text="PCA Model", variable=self.classification_method, value="pca").pack(anchor=tk.W)
+        # Manual controls (for debugging)
+        manual_frame = ttk.LabelFrame(left_frame, text="Manual Controls (Debug)", padding="10")
+        manual_frame.pack(pady=5, fill=tk.X)
 
-        ttk.Button(cluster_select_frame, text="🔍 Classify Selected Cluster", command=self.run_classification).pack(pady=10, fill=tk.X)
+        manual_buttons = ttk.Frame(manual_frame)
+        manual_buttons.pack()
 
-        # Right panel - Results
-        right_frame = ttk.Frame(main_frame)
-        right_frame.grid(row=0, column=1, padx=5, pady=5, sticky=(tk.W, tk.E, tk.N, tk.S))
+        ttk.Button(manual_buttons, text="Load Image", command=self.load_image).pack(side=tk.LEFT, padx=2)
+        ttk.Button(manual_buttons, text="Snapshot", command=self.take_snapshot).pack(side=tk.LEFT, padx=2)
 
-        # PCA values
-        pca_frame = ttk.LabelFrame(right_frame, text="PCA Components", padding="10")
-        pca_frame.pack(fill=tk.X, pady=5)
+        # Middle panel - Current Analysis
+        middle_frame = ttk.LabelFrame(main_frame, text="Current Analysis", padding="10")
+        middle_frame.grid(row=0, column=1, padx=5, pady=5, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        self.pc1_label = ttk.Label(pca_frame, text="PC1: --", font=("Arial", 12, "bold"), background="#E3F2FD", padding=5)
-        self.pc1_label.pack(fill=tk.X, pady=2)
-        self.pc2_label = ttk.Label(pca_frame, text="PC2: --", font=("Arial", 12, "bold"), background="#FFF3E0", padding=5)
-        self.pc2_label.pack(fill=tk.X, pady=2)
-        self.pc3_label = ttk.Label(pca_frame, text="PC3: --", font=("Arial", 12, "bold"), background="#F3E5F5", padding=5)
-        self.pc3_label.pack(fill=tk.X, pady=2)
+        # Current values with enhanced display
+        values_frame = ttk.LabelFrame(middle_frame, text="Current Readings", padding="10")
+        values_frame.pack(fill=tk.X, pady=5)
 
-        # Result
+        self.ir_label = ttk.Label(values_frame, text="IR: --", font=("Arial", 12, "bold"), 
+                                 background="#E3F2FD", padding=5)
+        self.ir_label.pack(fill=tk.X, pady=2)
+
+        self.yellow_label = ttk.Label(values_frame, text="Yellow Score: --", font=("Arial", 12, "bold"), 
+                                     background="#FFF9C4", padding=5)
+        self.yellow_label.pack(fill=tk.X, pady=2)
+
+        self.black_label = ttk.Label(values_frame, text="Black Score: --", font=("Arial", 12, "bold"), 
+                                    background="#F5F5F5", padding=5)
+        self.black_label.pack(fill=tk.X, pady=2)
+
+        self.pixels_label = ttk.Label(values_frame, text="Pixels: --", font=("Arial", 12, "bold"), 
+                                     background="#E8F5E8", padding=5)
+        self.pixels_label.pack(fill=tk.X, pady=2)
+
+        # Confidence display
+        self.confidence_label = ttk.Label(values_frame, text="Confidence: --", font=("Arial", 12, "bold"), 
+                                         background="#F3E5F5", padding=5)
+        self.confidence_label.pack(fill=tk.X, pady=2)
+
+        # Analysis progress
+        progress_frame = ttk.LabelFrame(middle_frame, text="Analysis Progress", padding="10")
+        progress_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        self.progress_text = tk.Text(progress_frame, height=15, width=35, font=("Courier", 10))
+        self.progress_text.pack(fill=tk.BOTH, expand=True)
+        progress_scrollbar = ttk.Scrollbar(progress_frame, command=self.progress_text.yview)
+        progress_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.progress_text.config(yscrollcommand=progress_scrollbar.set)
+
+        # Right panel - Final Results with Enhanced Display
+        right_frame = ttk.LabelFrame(main_frame, text="Final Results", padding="10")
+        right_frame.grid(row=0, column=2, padx=5, pady=5, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        # Result display
         result_frame = ttk.LabelFrame(right_frame, text="Classification Result", padding="10")
         result_frame.pack(fill=tk.X, pady=5)
 
-        self.result_label = ttk.Label(result_frame, text="Oil Type: --", font=("Arial", 14, "bold"), padding=10)
+        self.result_label = ttk.Label(result_frame, text="Analysis not started", 
+                                     font=("Arial", 14, "bold"), padding=10)
         self.result_label.pack(fill=tk.X)
+
         self.usability_label = ttk.Label(result_frame, text="", font=("Arial", 12), padding=5)
         self.usability_label.pack(fill=tk.X)
-        self.confidence_label = ttk.Label(result_frame, text="Confidence: --", font=("Arial", 10), padding=5)
-        self.confidence_label.pack(fill=tk.X)
 
-        # Info
-        info_frame = ttk.LabelFrame(right_frame, text="Detailed Information", padding="10")
-        info_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        self.info_text = tk.Text(info_frame, height=15, width=40, font=("Courier", 9))
-        self.info_text.pack(fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(info_frame, command=self.info_text.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.info_text.config(yscrollcommand=scrollbar.set)
+        # Distance comparison display
+        distances_frame = ttk.LabelFrame(right_frame, text="Distance Analysis", padding="10")
+        distances_frame.pack(fill=tk.X, pady=5)
 
-        self.status_label = ttk.Label(main_frame, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
-        self.status_label.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E))
+        self.distances_text = tk.Text(distances_frame, height=8, width=40, font=("Courier", 9))
+        self.distances_text.pack(fill=tk.BOTH, expand=True)
 
+        # Detailed results
+        details_frame = ttk.LabelFrame(right_frame, text="Detailed Results", padding="10")
+        details_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        self.details_text = tk.Text(details_frame, height=15, width=40, font=("Courier", 9))
+        self.details_text.pack(fill=tk.BOTH, expand=True)
+        details_scrollbar = ttk.Scrollbar(details_frame, command=self.details_text.yview)
+        details_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.details_text.config(yscrollcommand=details_scrollbar.set)
+
+        # Status bar
+        self.status_label = ttk.Label(main_frame, text="Ready - Enhanced 3D Classification", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_label.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E))
+
+        # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=2)
-        main_frame.columnconfigure(1, weight=1)
+        main_frame.columnconfigure(1, weight=2)
+        main_frame.columnconfigure(2, weight=2)
         main_frame.rowconfigure(0, weight=1)
 
+    def display_distance_analysis(self, result):
+        """Display detailed distance analysis"""
+        self.distances_text.delete(1.0, tk.END)
+        self.distances_text.insert(tk.END, "=== DISTANCE ANALYSIS ===\n")
+        self.distances_text.insert(tk.END, f"Best Match: {result['class']}\n")
+        self.distances_text.insert(tk.END, f"Confidence: {result['confidence']:.3f}\n\n")
+        
+        # Show top 3 closest matches
+        sorted_distances = sorted(result['all_distances'].items(), key=lambda x: x[1])
+        self.distances_text.insert(tk.END, "Top 3 Matches:\n")
+        for i, (oil_type, distance) in enumerate(sorted_distances[:3]):
+            marker = ">>> " if i == 0 else "    "
+            self.distances_text.insert(tk.END, f"{marker}{oil_type}: {distance:.4f}\n")
+        
+        self.distances_text.insert(tk.END, f"\nComponent Distances:\n")
+        comp_dist = result['component_distances']
+        self.distances_text.insert(tk.END, f"IR: {comp_dist['ir']:.2f}\n")
+        self.distances_text.insert(tk.END, f"Yellow: {comp_dist['yellow']:.2f}\n")
+        self.distances_text.insert(tk.END, f"Black: {comp_dist['black']:.2f}\n")
+
+    # [Include all the existing methods from the original code with minimal changes]
+    # I'll include the key methods that need modification:
+
+    def update_current_readings(self):
+        """Update current reading displays with enhanced information"""
+        if self.features is not None and len(self.features) > 11:
+            self.ir_label.config(text=f"IR: {self.features[11]:.2f}")
+        else:
+            self.ir_label.config(text="IR: --")
+            
+        self.yellow_label.config(text=f"Yellow Score: {self.current_yellow_score:.2f}")
+        self.black_label.config(text=f"Black Score: {self.current_black_score:.2f}")
+        
+        if self.segmentation_mask is not None:
+            pixels = np.sum(self.segmentation_mask)
+            self.pixels_label.config(text=f"Pixels: {pixels}")
+        else:
+            self.pixels_label.config(text="Pixels: --")
+
+    def show_single_liquid_result(self, result, pixel_count):
+        """Display results for single liquid analysis with enhanced info"""
+        self.result_label.config(text=f"Type: {result['class']}")
+        
+        bg_color = "#C8E6C9" if result['usable'] else "#FFCDD2"
+        status_text = "USABLE OIL" if result['usable'] else "UNUSABLE OIL"
+        self.usability_label.config(text=status_text, background=bg_color)
+        
+        # Update confidence display
+        self.confidence_label.config(text=f"Confidence: {result['confidence']:.3f}")
+        
+        # Display distance analysis
+        self.display_distance_analysis(result)
+        
+        self.details_text.delete(1.0, tk.END)
+        self.details_text.insert(tk.END, "=== ENHANCED SINGLE LIQUID ANALYSIS ===\n\n")
+        self.details_text.insert(tk.END, f"Type: {result['class']}\n")
+        self.details_text.insert(tk.END, f"Confidence: {result['confidence']:.3f}\n")
+        self.details_text.insert(tk.END, f"Total Distance: {result['total_distance']:.4f}\n")
+        self.details_text.insert(tk.END, f"Pixels: {pixel_count}\n")
+        self.details_text.insert(tk.END, f"Status: {status_text}\n\n")
+        
+        self.details_text.insert(tk.END, f"=== MEASURED VALUES ===\n")
+        self.details_text.insert(tk.END, f"IR Value: {result['ir_value']:.2f}\n")
+        self.details_text.insert(tk.END, f"Yellow Score: {result['yellow_score']:.2f}\n")
+        self.details_text.insert(tk.END, f"Black Score: {result['black_score']:.2f}\n\n")
+        
+        self.details_text.insert(tk.END, f"=== TARGET THRESHOLDS ===\n")
+        thresh = result['thresholds']
+        self.details_text.insert(tk.END, f"IR Threshold: {thresh['ir']:.2f}\n")
+        self.details_text.insert(tk.END, f"Yellow Threshold: {thresh['yellow']:.2f}\n")
+        self.details_text.insert(tk.END, f"Black Threshold: {thresh['black']:.2f}\n\n")
+        
+        self.details_text.insert(tk.END, f"=== DISTANCE BREAKDOWN ===\n")
+        comp_dist = result['component_distances']
+        self.details_text.insert(tk.END, f"IR Distance: {comp_dist['ir']:.2f}\n")
+        self.details_text.insert(tk.END, f"Yellow Distance: {comp_dist['yellow']:.2f}\n")
+        self.details_text.insert(tk.END, f"Black Distance: {comp_dist['black']:.2f}\n")
+        
+        self.automation_state = AutomationState.ANALYSIS_COMPLETE
+        self.action_button.config(text="🔄 Reset Analysis")
+        self.step_label.config(text="Analysis Complete")
+
+    # [Continue with all other existing methods from the original code]
+    # Here I'll add the essential methods that are needed but keep the same logic:
+
     def update_video_stream(self):
+        """Update the video feed with enhanced overlay display"""
         if not self.camera_available: return
         try:
             frames = self.pipeline.wait_for_frames(timeout_ms=100)
@@ -247,43 +465,150 @@ class OilClassificationGUI:
                 self.current_frame = frame_rgb
                 
                 display_frame = self.current_frame.copy()
-                if self.current_clusters:
-                    if self.show_cluster_0.get():
-                        cluster_0 = self.current_clusters.get('cluster_0', {})
-                        if cluster_0.get('mask') is not None:
-                            contours, _ = cv2.findContours(cluster_0['mask'].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                            cv2.drawContours(display_frame, contours, -1, (0, 255, 0), 2)
-                            if cluster_0['bbox'] != (0, 0, 0, 0):
-                                x1, y1, x2, y2 = cluster_0['bbox']
-                                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    if self.show_cluster_1.get():
-                        cluster_1 = self.current_clusters.get('cluster_1', {})
-                        if cluster_1.get('mask') is not None:
-                            contours, _ = cv2.findContours(cluster_1['mask'].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                            cv2.drawContours(display_frame, contours, -1, (255, 0, 255), 2)
-                elif self.segmentation_mask is not None:
-                    overlay = np.zeros_like(display_frame)
-                    overlay[self.segmentation_mask] = [0, 255, 0]
-                    display_frame = cv2.addWeighted(display_frame, 0.7, overlay, 0.3, 0)
-                    if self.bbox_coords:
-                        x1, y1, x2, y2 = self.bbox_coords
-                        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
                 
-                # Draw manual bbox being drawn
-                if self.manual_bbox_mode and self.temp_bbox:
-                    tx1, ty1, tx2, ty2 = self.temp_bbox
-                    # Convert screen coords to frame coords for drawing
-                    s = self.display_scale
-                    cv2.rectangle(display_frame, 
-                                (int(tx1/s), int(ty1/s)), 
-                                (int(tx2/s), int(ty2/s)), 
-                                (0, 0, 255), 2)
+                # Case 1: Dual liquid (2 clusters)
+                if self.current_clusters:
+                    # Show both cluster segmentations with different colors
+                    overlay_full = np.zeros_like(display_frame)
+                    
+                    cluster_colors = {
+                        'cluster_0': [255, 100, 100],  # Light red for cluster 0
+                        'cluster_1': [100, 100, 255]   # Light blue for cluster 1
+                    }
+                    
+                    # Draw full cluster masks
+                    for cluster_name, cluster_data in self.current_clusters.items():
+                        if cluster_data.get('mask') is not None:
+                            color = cluster_colors[cluster_name]
+                            overlay_full[cluster_data['mask']] = color
+                            
+                            # Draw cluster contours
+                            contours, _ = cv2.findContours(cluster_data['mask'].astype(np.uint8), 
+                                                         cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            cv2.drawContours(display_frame, contours, -1, color, 2)
+                            
+                            # Draw bounding box
+                            bbox = cluster_data.get('bbox', (0, 0, 0, 0))
+                            if bbox != (0, 0, 0, 0):
+                                x1, y1, x2, y2 = bbox
+                                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                                
+                                # Add cluster label with color info
+                                mean_color = cv2.mean(self.current_frame, mask=cluster_data['mask'].astype(np.uint8))[:3]
+                                color_desc = self.get_color_description(mean_color)
+                                label_text = f"{cluster_name.upper()}: {color_desc}"
+                                cv2.putText(display_frame, label_text, (x1, y1-10), 
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    
+                    # Add full cluster overlay
+                    display_frame = cv2.addWeighted(display_frame, 1.0, overlay_full, 0.05, 0)
+                    
+                    # Show current 1/3 segment if available
+                    if self.segmentation_mask is not None:
+                        overlay_third = np.zeros_like(display_frame)
+                        overlay_third[self.segmentation_mask] = [0, 255, 0]  # Green for 1/3 segment
+                        display_frame = cv2.addWeighted(display_frame, 1.0, overlay_third, 0.05, 0)
+                        
+                        # Draw 1/3 segment outline
+                        contours, _ = cv2.findContours(self.segmentation_mask.astype(np.uint8), 
+                                                     cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        cv2.drawContours(display_frame, contours, -1, [0, 255, 0], 3)
+                        
+                        # Add 1/3 segment label
+                        if self.bbox_coords:
+                            x1, y1, x2, y2 = self.bbox_coords
+                            cv2.putText(display_frame, "MIDDLE 1/3", (x1, y2+20), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, [0, 255, 0], 2)
+                
+                # Case 2: Single liquid
+                elif self.segmentation_mask is not None:
+                    # First, get the original full segmentation for display
+                    if hasattr(self, 'original_segmentation_mask') and self.original_segmentation_mask is not None:
+                        full_mask = self.original_segmentation_mask
+                    else:
+                        # If we don't have the original, try to reconstruct or use current
+                        full_mask = self.segmentation_mask
+                    
+                    # Show full liquid segmentation in blue
+                    overlay_full = np.zeros_like(display_frame)
+                    overlay_full[full_mask] = [100, 150, 255]  # Light blue for full liquid
+                    display_frame = cv2.addWeighted(display_frame, 1.0, overlay_full, 0.05, 0)
+                    
+                    # Draw full liquid contour
+                    contours, _ = cv2.findContours(full_mask.astype(np.uint8), 
+                                                 cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(display_frame, contours, -1, [100, 150, 255], 2)
+                    
+                    # Show current 1/3 segment if different from full
+                    if not np.array_equal(self.segmentation_mask, full_mask):
+                        overlay_third = np.zeros_like(display_frame)
+                        overlay_third[self.segmentation_mask] = [0, 255, 0]  # Green for 1/3 segment
+                        display_frame = cv2.addWeighted(display_frame, 1.0, overlay_third, 0.05, 0)
+                        
+                        # Draw 1/3 segment outline
+                        contours_third, _ = cv2.findContours(self.segmentation_mask.astype(np.uint8), 
+                                                           cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        cv2.drawContours(display_frame, contours_third, -1, [0, 255, 0], 3)
+                    
+                    # Add labels
+                    if hasattr(self, 'bbox_coords') and self.bbox_coords:
+                        x1, y1, x2, y2 = self.bbox_coords
+                        
+                        # Get liquid color description
+                        mean_color = cv2.mean(self.current_frame, mask=full_mask.astype(np.uint8))[:3]
+                        color_desc = self.get_color_description(mean_color)
+                        
+                        cv2.putText(display_frame, f"LIQUID: {color_desc}", (x1, y1-30), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, [100, 150, 255], 2)
+                        cv2.putText(display_frame, "MIDDLE 1/3", (x1, y2+20), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, [0, 255, 0], 2)
 
                 self.display_image(display_frame)
-        except Exception as e: print(f"Video stream error: {e}")
+        except Exception as e: 
+            print(f"Video stream error: {e}")
         self.root.after(30, self.update_video_stream)
 
+    def get_color_description(self, mean_color):
+        """Get a descriptive name for the liquid color based on RGB values"""
+        r, g, b = mean_color
+        
+        # Calculate color characteristics
+        brightness = (r + g + b) / 3
+        yellow_score = min(r, g) - b
+        
+        if brightness < 80:
+            if yellow_score < 5:
+                return "Dark/Black"
+            else:
+                return "Dark Brown"
+        elif brightness < 120:
+            if yellow_score > 20:
+                return "Golden Brown"
+            elif b > r and b > g:
+                return "Dark Blue"
+            else:
+                return "Medium Brown"
+        elif brightness < 160:
+            if yellow_score > 30:
+                return "Golden Yellow"
+            elif b > r and b > g:
+                return "Blue"
+            elif g > r and g > b:
+                return "Green"
+            else:
+                return "Light Brown"
+        else:  # brightness >= 160
+            if yellow_score > 20:
+                return "Light Yellow"
+            elif b > (r + g) * 0.6:
+                return "Light Blue"
+            elif abs(r - g) < 20 and abs(g - b) < 20:
+                return "Clear/White"
+            else:
+                return "Light"
+
     def display_image(self, image):
+        """Display image in the GUI"""
         image_pil = Image.fromarray(image)
         orig_w, orig_h = image_pil.size
         
@@ -298,260 +623,18 @@ class OilClassificationGUI:
         self.video_label.config(image=photo)
         self.video_label.image = photo
 
-    def toggle_manual_bbox(self):
-        self.manual_bbox_mode = not self.manual_bbox_mode
-        if self.manual_bbox_mode:
-            self.update_status("Manual BBox Mode: ON - Click and drag to select area")
-            self.video_label.config(cursor="cross")
-        else:
-            self.update_status("Manual BBox Mode: OFF")
-            self.video_label.config(cursor="")
-            self.temp_bbox = None
-
-    def on_mouse_down(self, event):
-        if not self.manual_bbox_mode or self.current_frame is None: return
-        self.drawing = True
-        self.start_x = event.x
-        self.start_y = event.y
-        self.temp_bbox = (event.x, event.y, event.x, event.y)
-
-    def on_mouse_move(self, event):
-        if not self.drawing: return
-        self.temp_bbox = (self.start_x, self.start_y, event.x, event.y)
-
-    def on_mouse_up(self, event):
-        if not self.drawing: return
-        self.drawing = False
-        
-        x1, y1 = self.start_x, self.start_y
-        x2, y2 = event.x, event.y
-        
-        # Normalize coordinates
-        x_min, x_max = sorted([x1, x2])
-        y_min, y_max = sorted([y1, y2])
-        
-        # Convert to frame coordinates
-        scale = self.display_scale
-        fx_min = int(x_min / scale)
-        fx_max = int(x_max / scale)
-        fy_min = int(y_min / scale)
-        fy_max = int(y_max / scale)
-        
-        # Clamp to frame dimensions
-        h, w = self.current_frame.shape[:2]
-        fx_min = max(0, min(fx_min, w))
-        fx_max = max(0, min(fx_max, w))
-        fy_min = max(0, min(fy_min, h))
-        fy_max = max(0, min(fy_max, h))
-        
-        if (fx_max - fx_min) > 10 and (fy_max - fy_min) > 10:
-            self.bbox_coords = (fx_min, fy_min, fx_max, fy_max)
-            
-            # Create a simple rectangular mask
-            self.segmentation_mask = np.zeros((h, w), dtype=np.uint8)
-            self.segmentation_mask[fy_min:fy_max, fx_min:fx_max] = 1
-            
-            # Clear polygon coords as we don't have a polygon for manual box
-            self.polygon_coords = None
-            
-            # Clear auto seg results to avoid confusion
-            self.auto_seg_results = None
-            self.current_clusters = {}
-            
-            self.update_status(f"Manual BBox set: {self.bbox_coords}")
-            self.manual_bbox_mode = False
-            self.video_label.config(cursor="")
-        else:
-            self.update_status("Selection too small")
-            
-        self.temp_bbox = None
-
-    def run_segmentation(self):
-        if self.current_frame is None: return
-        
-        prompt = self.segmentation_prompt.get()
-        n_clusters = 1 if prompt == "Liquid" else 2
-        
-        self.update_status(f"Running auto-segmentation ({prompt})...")
-        try:
-            image_bgr = cv2.cvtColor(self.current_frame, cv2.COLOR_RGB2BGR)
-            self.auto_seg_results = self.auto_segmenter.process_frame(image_bgr, prompt=prompt, n_clusters=n_clusters)
-            self.update_cluster_data()
-            
-            if self.auto_seg_results and self.auto_seg_results['segmentation_mask'] is not None:
-                # Select larger cluster
-                c0 = self.current_clusters.get('cluster_0', {})
-                c1 = self.current_clusters.get('cluster_1', {})
-                a0 = np.sum(c0.get('mask', 0)) if c0.get('mask') is not None else 0
-                a1 = np.sum(c1.get('mask', 0)) if c1.get('mask') is not None else 0
-                
-                if n_clusters == 1:
-                    # If only 1 cluster requested, use cluster_0
-                    sel, sel_name = c0, 'cluster_0'
-                else:
-                    if a0 >= a1 and a0 > 0: sel, sel_name = c0, 'cluster_0'
-                    elif a1 > 0: sel, sel_name = c1, 'cluster_1'
-                    else: sel = None
-
-                if sel and sel.get('mask') is not None:
-                    self.segmentation_mask = sel['mask']
-                    self.bbox_coords = sel['bbox']
-                    self.polygon_coords = self.auto_seg_results.get('polygons', {}).get(sel_name, [])
-                    self.update_status(f"Segmentation complete (using {sel_name})")
-                else: messagebox.showwarning("Warning", "No valid segmentation")
-            else: messagebox.showwarning("Warning", "Segmentation failed")
-        except Exception as e: messagebox.showerror("Error", f"Seg failed: {e}")
-
-    def run_clustering_on_mask(self):
-        if self.current_frame is None or self.segmentation_mask is None: return
-        self.update_status("Running clustering...")
-        try:
-            image_bgr = cv2.cvtColor(self.current_frame, cv2.COLOR_RGB2BGR)
-            clustering = self.auto_segmenter.apply_kmeans_clustering(image_bgr, self.segmentation_mask, n_clusters=2)
-            bboxes = self.auto_segmenter.get_cluster_bboxes(clustering['cluster_masks'])
-            polygons = self.auto_segmenter.get_cluster_polygons(clustering['cluster_masks'])
-            
-            self.auto_seg_results = {
-                'segmentation_mask': self.segmentation_mask,
-                'clustering': clustering,
-                'bboxes': bboxes,
-                'polygons': polygons
-            }
-            self.update_cluster_data()
-            self.update_status("Clustering complete")
-        except Exception as e: messagebox.showerror("Error", f"Clustering failed: {e}")
-
-    def refine_mask_middle_third(self):
-        """Keep only the middle 1/3 (vertically) of the current mask"""
-        if self.segmentation_mask is None:
-            messagebox.showwarning("Warning", "No mask available")
-            return
-
-        try:
-            # Get bounding box of current mask
-            rows = np.any(self.segmentation_mask, axis=1)
-            cols = np.any(self.segmentation_mask, axis=0)
-            
-            if not np.any(rows) or not np.any(cols):
-                messagebox.showwarning("Warning", "Mask is empty")
-                return
-                
-            y_min, y_max = np.where(rows)[0][[0, -1]]
-            x_min, x_max = np.where(cols)[0][[0, -1]]
-            
-            height = y_max - y_min
-            
-            # Calculate middle 1/3 vertical range
-            new_y_min = int(y_min + height / 3)
-            new_y_max = int(y_min + 2 * height / 3)
-            
-            # Create new mask
-            new_mask = np.zeros_like(self.segmentation_mask)
-            new_mask[new_y_min:new_y_max, :] = self.segmentation_mask[new_y_min:new_y_max, :]
-            
-            # Update state
-            self.segmentation_mask = new_mask
-            
-            # Update bbox
-            rows_new = np.any(new_mask, axis=1)
-            cols_new = np.any(new_mask, axis=0)
-            if np.any(rows_new) and np.any(cols_new):
-                ny_min, ny_max = np.where(rows_new)[0][[0, -1]]
-                nx_min, nx_max = np.where(cols_new)[0][[0, -1]]
-                self.bbox_coords = (nx_min, ny_min, nx_max, ny_max)
-            
-            # Clear polygons as they are no longer valid for the sliced mask
-            self.polygon_coords = None
-            
-            # Clear auto seg results to avoid confusion
-            self.auto_seg_results = None
-            self.current_clusters = {}
-            
-            self.update_status(f"Mask refined to middle 1/3 (H: {height} -> {new_y_max - new_y_min})")
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Refinement failed: {e}")
-
-    def detect_yellow_liquid(self):
-        if self.current_frame is None: return
-        self.update_status("Detecting yellow liquid...")
-        try:
-            image_bgr = cv2.cvtColor(self.current_frame, cv2.COLOR_RGB2BGR)
-            res = self.auto_segmenter.process_frame(image_bgr, prompt="yellow liquid", n_clusters=2)
-            if res and res['segmentation_mask'] is not None and np.sum(res['segmentation_mask']) > 100:
-                self.auto_seg_results = res
-                self.update_cluster_data()
-                self.segmentation_mask = res['segmentation_mask']
-                self.update_status(f"✓ Yellow liquid detected!")
-                messagebox.showinfo("Success", f"Yellow liquid detected!")
-            else: messagebox.showwarning("Failed", "Yellow liquid area too small or not found.")
-        except Exception as e: messagebox.showerror("Error", f"Detection failed: {e}")
-
-    def update_cluster_data(self):
-        if not self.auto_seg_results: return
-        cl = self.auto_seg_results['clustering']
-        bb = self.auto_seg_results['bboxes']
-        
-        self.current_clusters = {
-            'cluster_0': {'bbox': bb.get('cluster_0', (0,0,0,0)), 'mask': cl['cluster_masks'].get('cluster_0'), 'stats': cl['cluster_stats'].get('cluster_0', {})},
-            'cluster_1': {'bbox': bb.get('cluster_1', (0,0,0,0)), 'mask': cl['cluster_masks'].get('cluster_1'), 'stats': cl['cluster_stats'].get('cluster_1', {})}
-        }
-        
-        c0, c1 = self.current_clusters['cluster_0'], self.current_clusters['cluster_1']
-        a0 = np.sum(c0.get('mask', 0)) if c0.get('mask') is not None else 0
-        a1 = np.sum(c1.get('mask', 0)) if c1.get('mask') is not None else 0
-        self.cluster_0_info.config(text=f"Cluster 0: {a0} px ({c0.get('stats',{}).get('percentage',0):.1f}%)")
-        self.cluster_1_info.config(text=f"Cluster 1: {a1} px ({c1.get('stats',{}).get('percentage',0):.1f}%)")
-
-    def run_classification(self):
-        sel = self.selected_cluster_for_classification.get()
-        if sel == "auto" and self.segmentation_mask is None:
-            messagebox.showwarning("Warning", "Run segmentation first")
-            return
-            
-        if sel != "auto":
-            c = self.current_clusters.get(sel, {})
-            if c.get('mask') is None or np.sum(c.get('mask', 0)) == 0:
-                messagebox.showwarning("Warning", f"{sel} not available")
-                return
-            self.segmentation_mask = c['mask']
-            self.bbox_coords = c['bbox']
-
-        self.features = self.extract_features()
-        if self.features is None: return
-
-        method = self.classification_method.get()
-        if method == "ir":
-            self.update_status("Classifying (IR)...")
-            ir_val = self.features[11]
-            self.classification_result = self.classify_by_ir_cluster(ir_val)
-            self.pca_values = np.array([0.0, 0.0, ir_val])
-            self.pc1_label.config(text="PC1: N/A")
-            self.pc2_label.config(text="PC2: N/A")
-            self.pc3_label.config(text=f"IR: {ir_val:.2f}")
-        else:
-            self.update_status("Classifying (PCA)...")
-            f_std = (self.features - self.pca_mean) / self.pca_std
-            self.pca_values = np.dot(f_std, self.pca_components.T)
-            self.update_pca_display()
-            self.classification_result = self.classify_nearest_centroid()
-
-        self.update_result_display()
-        self.update_status("Classification complete")
-
     def calculate_yellow_score(self, img_rgb, mask=None):
-        """Method: Min(R, G) - B"""
-        mean = cv2.mean(img_rgb, mask=mask)[:3] if mask is not None else cv2.mean(img_rgb)[:3]
+        """Calculate Yellow Score: Min(R, G) - B"""
+        if mask is not None:
+            mean = cv2.mean(img_rgb, mask=mask.astype(np.uint8))[:3]
+        else:
+            mean = cv2.mean(img_rgb)[:3]
         return max(0.0, min(mean[0], mean[1]) - mean[2])
 
     def calculate_black_score(self, img_rgb, mask=None):
-        """
-        [NEW] Calculate Black Score using Inverted Luminance.
-        Formula: 255 - (0.299R + 0.587G + 0.114B)
-        High value = Black/Dark. Low value = White/Bright.
-        """
+        """Calculate Black Score: Inverted Luminance (255 - luminance)"""
         if mask is not None:
-            mean = cv2.mean(img_rgb, mask=mask)[:3]
+            mean = cv2.mean(img_rgb, mask=mask.astype(np.uint8))[:3]
         else:
             mean = cv2.mean(img_rgb)[:3]
             
@@ -559,32 +642,580 @@ class OilClassificationGUI:
         luminance = (0.299 * r) + (0.587 * g) + (0.114 * b)
         return max(0.0, 255 - luminance)
 
-    def extract_features(self):
-        if self.current_frame is None or self.segmentation_mask is None: return None
+    def load_image(self):
+        """Load image from file"""
+        fn = filedialog.askopenfilename()
+        if fn:
+            img = cv2.imread(fn)
+            self.current_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            self.display_image(self.current_frame)
+            self.update_status(f"Loaded: {fn}")
+
+    def take_snapshot(self):
+        """Take a snapshot of current frame"""
+        if self.current_frame is not None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            cv2.imwrite(f"snapshot_{ts}.jpg", cv2.cvtColor(self.current_frame, cv2.COLOR_RGB2BGR))
+            self.update_status(f"Saved snapshot_{ts}.jpg")
+
+    def update_status(self, msg):
+        """Update status bar"""
+        self.status_label.config(text=msg)
+        self.root.update_idletasks()
+
+    def add_progress_log(self, message):
+        """Add a message to the progress log"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.progress_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.progress_text.see(tk.END)
+        self.root.update_idletasks()
+
+    def reset_automation(self):
+        """Reset the automation to start state"""
+        self.automation_state = AutomationState.IDLE
+        self.action_button.config(text="🚀 START ANALYSIS")
+        self.step_label.config(text="Ready to start analysis")
+        
+        # Clear all data
+        self.segmentation_mask = None
+        self.original_segmentation_mask = None  # Clear original mask too
+        self.bbox_coords = None
+        self.current_clusters = {}
+        self.ir_values = {}
+        self.rgb_values = {}
+        self.final_results = {}
+        
+        # Clear displays
+        self.result_label.config(text="Analysis not started")
+        self.usability_label.config(text="", background="")
+        self.progress_text.delete(1.0, tk.END)
+        self.details_text.delete(1.0, tk.END)
+        self.distances_text.delete(1.0, tk.END)
+        
+        # Reset current readings
+        self.ir_label.config(text="IR: --")
+        self.yellow_label.config(text="Yellow Score: --")
+        self.black_label.config(text="Black Score: --")
+        self.pixels_label.config(text="Pixels: --")
+        self.confidence_label.config(text="Confidence: --")
+        
+        self.update_status("Reset complete - ready for new analysis")
+
+    def cleanup(self):
+        """Cleanup resources"""
+        if self.camera_available: 
+            self.pipeline.stop()
+
+    def handle_automation_step(self):
+        """Handle the current automation step"""
+        try:
+            if self.automation_state == AutomationState.IDLE:
+                self.start_liquid_segmentation()
+            elif self.automation_state == AutomationState.WAITING_IR_READ:
+                self.read_ir_values()
+            elif self.automation_state == AutomationState.WAITING_RGB_SINGLE:
+                self.read_rgb_single_liquid()
+            elif self.automation_state == AutomationState.WAITING_RGB_CLUSTER1:
+                self.read_rgb_cluster1()
+            elif self.automation_state == AutomationState.WAITING_RGB_CLUSTER2:
+                self.read_rgb_cluster2()
+            else:
+                self.update_status("Invalid automation state")
+        except Exception as e:
+            messagebox.showerror("Error", f"Automation step failed: {e}")
+            self.add_progress_log(f"ERROR: {e}")
+
+    def start_liquid_segmentation(self):
+        """Step 1: Start with liquid segmentation"""
+        if self.current_frame is None:
+            messagebox.showwarning("Warning", "No camera feed available")
+            return
+
+        self.add_progress_log("=== STARTING ANALYSIS ===")
+        self.add_progress_log("Step 1: Liquid segmentation...")
+        
+        try:
+            image_bgr = cv2.cvtColor(self.current_frame, cv2.COLOR_RGB2BGR)
+            self.auto_seg_results = self.auto_segmenter.process_frame(image_bgr, prompt="Liquid", n_clusters=1)
+            
+            if self.auto_seg_results and self.auto_seg_results['segmentation_mask'] is not None:
+                self.segmentation_mask = self.auto_seg_results['segmentation_mask']
+                # Store original segmentation for dual display
+                self.original_segmentation_mask = self.segmentation_mask.copy()
+                
+                pixel_count = np.sum(self.segmentation_mask)
+                
+                self.add_progress_log(f"Liquid detected: {pixel_count} pixels")
+                
+                # Step 1: Check capacity
+                if pixel_count < MIN_CAPACITY_PIXELS:
+                    self.add_progress_log("❌ CAPACITY NOT MATCH")
+                    self.result_label.config(text="CAPACITY NOT MATCH")
+                    self.usability_label.config(text="Insufficient liquid volume", background="#FFCDD2")
+                    self.automation_state = AutomationState.ANALYSIS_COMPLETE
+                    self.action_button.config(text="🔄 Reset", state="normal")
+                    return
+                
+                # Step 2: Check for layering with clustering
+                self.add_progress_log("Step 2: Checking for layering...")
+                self.check_layering()
+                
+            else:
+                messagebox.showwarning("Warning", "Liquid segmentation failed")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Liquid segmentation failed: {e}")
+
+    def check_layering(self):
+        """Step 2: Check if liquid has layering using clustering"""
+        try:
+            # Apply clustering to detect layering
+            image_bgr = cv2.cvtColor(self.current_frame, cv2.COLOR_RGB2BGR)
+            
+            # Create middle region mask to avoid bottle edges
+            h, w = self.segmentation_mask.shape
+            middle_mask = np.zeros_like(self.segmentation_mask)
+            start_x = w // 4
+            end_x = 3 * w // 4
+            middle_mask[:, start_x:end_x] = self.segmentation_mask[:, start_x:end_x]
+            
+            clustering = self.auto_segmenter.apply_kmeans_clustering(image_bgr, middle_mask, n_clusters=2)
+            
+            # Check if there's significant difference between clusters
+            cluster_0_mask = clustering['cluster_masks'].get('cluster_0')
+            cluster_1_mask = clustering['cluster_masks'].get('cluster_1')
+            
+            if cluster_0_mask is not None and cluster_1_mask is not None:
+                area_0 = np.sum(cluster_0_mask)
+                area_1 = np.sum(cluster_1_mask)
+                
+                # Check if both clusters have reasonable size
+                total_area = area_0 + area_1
+                ratio_0 = area_0 / total_area if total_area > 0 else 0
+                ratio_1 = area_1 / total_area if total_area > 0 else 0
+                
+                # MUCH MORE STRICT criteria for layering detection
+                # Both clusters must have at least 30% of the area (instead of 15%)
+                min_cluster_ratio = 0.30
+                
+                # Check color difference between clusters
+                roi_rgb = self.current_frame
+                mean_color_0 = cv2.mean(roi_rgb, mask=cluster_0_mask.astype(np.uint8))[:3]
+                mean_color_1 = cv2.mean(roi_rgb, mask=cluster_1_mask.astype(np.uint8))[:3]
+                
+                # Calculate color distance (Euclidean distance in RGB space)
+                color_diff = np.sqrt(np.sum([(mean_color_0[i] - mean_color_1[i])**2 for i in range(3)]))
+                
+                # Check vertical separation (clusters should be in different vertical regions)
+                cluster_0_center_y = np.mean(np.where(cluster_0_mask)[0]) if np.any(cluster_0_mask) else 0
+                cluster_1_center_y = np.mean(np.where(cluster_1_mask)[0]) if np.any(cluster_1_mask) else 0
+                vertical_separation = abs(cluster_0_center_y - cluster_1_center_y)
+                min_vertical_separation = h * 0.1  # At least 10% of image height separation
+                
+                self.add_progress_log(f"Cluster analysis:")
+                self.add_progress_log(f"  - Ratio 0: {ratio_0:.3f}, Ratio 1: {ratio_1:.3f}")
+                self.add_progress_log(f"  - Color difference: {color_diff:.2f}")
+                self.add_progress_log(f"  - Vertical separation: {vertical_separation:.1f}px")
+                
+                # Very strict criteria: ALL conditions must be met
+                layering_detected = (
+                    ratio_0 >= min_cluster_ratio and 
+                    ratio_1 >= min_cluster_ratio and
+                    color_diff > 25.0 and  # Significant color difference
+                    vertical_separation > min_vertical_separation  # Vertical separation
+                )
+                
+                if layering_detected:
+                    self.add_progress_log(f"✓ STRONG layering detected (Areas: {area_0}, {area_1})")
+                    
+                    # Store cluster data
+                    bboxes = self.auto_segmenter.get_cluster_bboxes(clustering['cluster_masks'])
+                    self.current_clusters = {
+                        'cluster_0': {
+                            'mask': cluster_0_mask,
+                            'bbox': bboxes.get('cluster_0', (0,0,0,0)),
+                            'area': area_0
+                        },
+                        'cluster_1': {
+                            'mask': cluster_1_mask,
+                            'bbox': bboxes.get('cluster_1', (0,0,0,0)),
+                            'area': area_1
+                        }
+                    }
+                    
+                    # Step 3: Wait for IR reading
+                    self.automation_state = AutomationState.WAITING_IR_READ
+                    self.action_button.config(text="📡 Read IR Values")
+                    self.step_label.config(text="Step 3: Click to read IR values")
+                    
+                else:
+                    self.add_progress_log("No significant layering found - treating as single liquid")
+                    self.add_progress_log("  (Requires: >30% each cluster, >25 color diff, vertical separation)")
+                    self.handle_single_liquid()
+                    
+            else:
+                self.add_progress_log("Clustering failed - treating as single liquid")
+                self.handle_single_liquid()
+                
+        except Exception as e:
+            self.add_progress_log(f"Layering check failed: {e}")
+            self.handle_single_liquid()
+
+    def handle_single_liquid(self):
+        """Handle single liquid path (steps 6-10)"""
+        # Step 6: Show middle 1/3 mask
+        self.create_middle_third_mask()
+        self.add_progress_log("Step 6: Using middle 1/3 segment")
+        
+        # Step 7: Wait for IR reading (even for single liquid)
+        self.automation_state = AutomationState.WAITING_IR_READ
+        self.action_button.config(text="📡 Read IR Value")
+        self.step_label.config(text="Step 7: Click to read IR value")
+
+    def read_ir_values(self):
+        """Step 4: Read IR values for each cluster OR single liquid"""
+        self.add_progress_log("Step 4: Reading IR values...")
+        
         try:
             if self.camera_available:
                 frames = self.pipeline.wait_for_frames(timeout_ms=100)
                 ir = np.asanyarray(frames.get_infrared_frame().get_data())
                 if ROTATE_PREVIEW: ir = cv2.rotate(ir, ROTATE_DIR)
-            else: ir = np.ones(self.current_frame.shape[:2], dtype=np.uint8) * 150
+            else:
+                ir = np.ones(self.current_frame.shape[:2], dtype=np.uint8) * 150
+
+            # Check if we have clusters (dual liquid) or single liquid
+            if self.current_clusters:
+                # Dual liquid path - read IR for both clusters
+                cluster_0_ir = cv2.mean(ir, mask=self.current_clusters['cluster_0']['mask'].astype(np.uint8))[0]
+                cluster_1_ir = cv2.mean(ir, mask=self.current_clusters['cluster_1']['mask'].astype(np.uint8))[0]
+                
+                self.ir_values = {
+                    'cluster_0': cluster_0_ir,
+                    'cluster_1': cluster_1_ir
+                }
+                
+                ir_diff = abs(cluster_0_ir - cluster_1_ir)
+                
+                self.add_progress_log(f"Cluster 0 IR: {cluster_0_ir:.2f}")
+                self.add_progress_log(f"Cluster 1 IR: {cluster_1_ir:.2f}")
+                self.add_progress_log(f"IR Difference: {ir_diff:.2f}")
+                
+                # Step 5: Check IR difference
+                if ir_diff > 10:
+                    self.add_progress_log("✓ Significant IR difference - analyzing both clusters")
+                    self.handle_dual_liquid()
+                else:
+                    self.add_progress_log("No significant IR difference - treating as single liquid")
+                    # Clear clusters and continue as single liquid
+                    self.current_clusters = {}
+                    self.automation_state = AutomationState.WAITING_RGB_SINGLE
+                    self.action_button.config(text="🎨 Read RGB Values")
+                    self.step_label.config(text="Step 8: Click to read RGB values")
+            else:
+                # Single liquid path - read IR for the segmented area
+                single_ir = cv2.mean(ir, mask=self.segmentation_mask.astype(np.uint8))[0]
+                
+                self.ir_values = {'single': single_ir}
+                
+                self.add_progress_log(f"Single liquid IR: {single_ir:.2f}")
+                
+                # Move to RGB reading
+                self.automation_state = AutomationState.WAITING_RGB_SINGLE
+                self.action_button.config(text="🎨 Read RGB Values")
+                self.step_label.config(text="Step 8: Click to read RGB values")
+                
+        except Exception as e:
+            self.add_progress_log(f"IR reading failed: {e}")
+            messagebox.showerror("Error", f"IR reading failed: {e}")
+
+    def handle_dual_liquid(self):
+        """Handle dual liquid path (steps 11-19)"""
+        # Step 11: Show middle 1/3 mask for cluster 1
+        self.create_cluster_middle_third_mask('cluster_0')
+        self.add_progress_log("Step 11: Using middle 1/3 of cluster 0")
+        
+        # Step 12: Wait for RGB reading of cluster 1
+        self.automation_state = AutomationState.WAITING_RGB_CLUSTER1
+        self.action_button.config(text="🎨 Read RGB Cluster 0")
+        self.step_label.config(text="Step 12: Click to read RGB for cluster 0")
+
+    def read_rgb_single_liquid(self):
+        """Step 8-10: Read RGB for single liquid and predict"""
+        self.add_progress_log("Step 8: Reading RGB values...")
+        
+        try:
+            # Extract features for current mask
+            self.features = self.extract_features()
+            if self.features is None:
+                raise Exception("Feature extraction failed")
+
+            # Calculate RGB scores
+            roi_rgb = self.get_masked_roi()
+            self.current_yellow_score = self.calculate_yellow_score(roi_rgb, self.segmentation_mask)
+            self.current_black_score = self.calculate_black_score(roi_rgb, self.segmentation_mask)
+            
+            self.update_current_readings()
+            
+            # Step 9: Predict type
+            self.add_progress_log("Step 9: Predicting liquid type...")
+            
+            # Use IR value from single liquid reading or extracted features
+            if 'single' in self.ir_values:
+                ir_val = self.ir_values['single']
+            elif self.features is not None and len(self.features) > 11:
+                ir_val = self.features[11]
+            else:
+                ir_val = 150  # fallback value
+                
+            result = self.classify_by_ir_and_rgb(ir_val, self.current_yellow_score, self.current_black_score)
+            
+            pixel_count = np.sum(self.segmentation_mask)
+            
+            # Step 10: Show results
+            self.add_progress_log("Step 10: Analysis complete")
+            self.add_progress_log(f"Type: {result['class']}")
+            self.add_progress_log(f"Confidence: {result['confidence']:.3f}")
+            self.add_progress_log(f"Pixels: {pixel_count}")
+            
+            self.show_single_liquid_result(result, pixel_count)
+            
+        except Exception as e:
+            self.add_progress_log(f"RGB reading failed: {e}")
+            messagebox.showerror("Error", f"RGB reading failed: {e}")
+
+    def read_rgb_cluster1(self):
+        """Step 13: Read RGB for cluster 0"""
+        self.add_progress_log("Step 13: Reading RGB for cluster 0...")
+        
+        try:
+            # Use cluster 0 mask
+            mask = self.current_clusters['cluster_0']['mask']
+            roi_rgb = self.get_masked_roi()
+            
+            yellow_score = self.calculate_yellow_score(roi_rgb, mask)
+            black_score = self.calculate_black_score(roi_rgb, mask)
+            
+            self.rgb_values['cluster_0'] = {
+                'yellow': yellow_score,
+                'black': black_score
+            }
+            
+            self.add_progress_log(f"Cluster 0 - Yellow: {yellow_score:.2f}, Black: {black_score:.2f}")
+            
+            # Step 14: Move to cluster 1
+            self.create_cluster_middle_third_mask('cluster_1')
+            self.add_progress_log("Step 14: Using middle 1/3 of cluster 1")
+            
+            self.automation_state = AutomationState.WAITING_RGB_CLUSTER2
+            self.action_button.config(text="🎨 Read RGB Cluster 1")
+            self.step_label.config(text="Step 15: Click to read RGB for cluster 1")
+            
+        except Exception as e:
+            self.add_progress_log(f"RGB cluster 0 reading failed: {e}")
+            messagebox.showerror("Error", f"RGB cluster 0 reading failed: {e}")
+
+    def read_rgb_cluster2(self):
+        """Step 16: Read RGB for cluster 1 and complete analysis"""
+        self.add_progress_log("Step 16: Reading RGB for cluster 1...")
+        
+        try:
+            # Use cluster 1 mask
+            mask = self.current_clusters['cluster_1']['mask']
+            roi_rgb = self.get_masked_roi()
+            
+            yellow_score = self.calculate_yellow_score(roi_rgb, mask)
+            black_score = self.calculate_black_score(roi_rgb, mask)
+            
+            self.rgb_values['cluster_1'] = {
+                'yellow': yellow_score,
+                'black': black_score
+            }
+            
+            self.add_progress_log(f"Cluster 1 - Yellow: {yellow_score:.2f}, Black: {black_score:.2f}")
+            
+            # Step 17: Predict both types
+            self.add_progress_log("Step 17: Predicting both liquid types...")
+            self.analyze_dual_liquids()
+            
+        except Exception as e:
+            self.add_progress_log(f"RGB cluster 1 reading failed: {e}")
+            messagebox.showerror("Error", f"RGB cluster 1 reading failed: {e}")
+
+    def analyze_dual_liquids(self):
+        """Steps 17-19: Analyze dual liquids and determine usability"""
+        try:
+            # Predict types for both clusters
+            results = {}
+            for cluster_name in ['cluster_0', 'cluster_1']:
+                ir_val = self.ir_values[cluster_name]
+                yellow = self.rgb_values[cluster_name]['yellow']
+                black = self.rgb_values[cluster_name]['black']
+                
+                result = self.classify_by_ir_and_rgb(ir_val, yellow, black)
+                results[cluster_name] = result
+                
+                self.add_progress_log(f"{cluster_name}: {result['class']} (conf: {result['confidence']:.3f})")
+            
+            # Step 18: Check if any cluster has usable oil
+            cluster_0_type = results['cluster_0']['class']
+            cluster_1_type = results['cluster_1']['class']
+            
+            usable_oils = ['Light oil', 'Medium oil', 'Dark oil']
+            cluster_0_usable = cluster_0_type in usable_oils
+            cluster_1_usable = cluster_1_type in usable_oils
+            
+            if not cluster_0_usable and not cluster_1_usable:
+                self.add_progress_log("Step 18: No usable oil found")
+                self.show_dual_liquid_result(results, usable=False, reason="No usable oil types")
+                return
+            
+            # Step 19: Check water percentage if there's usable oil
+            water_cluster = None
+            oil_cluster = None
+            
+            if cluster_0_type == 'Water' or 'Water' in cluster_0_type:
+                water_cluster = 'cluster_0'
+                oil_cluster = 'cluster_1'
+            elif cluster_1_type == 'Water' or 'Water' in cluster_1_type:
+                water_cluster = 'cluster_1'
+                oil_cluster = 'cluster_0'
+            
+            if water_cluster:
+                water_area = self.current_clusters[water_cluster]['area']
+                oil_area = self.current_clusters[oil_cluster]['area']
+                total_area = water_area + oil_area
+                water_percentage = (water_area / total_area) * 100 if total_area > 0 else 0
+                
+                self.add_progress_log(f"Water percentage: {water_percentage:.1f}%")
+                
+                if water_percentage > 50:
+                    self.add_progress_log("Step 19: Too much water")
+                    self.show_dual_liquid_result(results, usable=False, reason="Too much water (>50%)")
+                else:
+                    self.add_progress_log("Step 19: Water level acceptable")
+                    self.show_dual_liquid_result(results, usable=True, reason="Acceptable water level")
+            else:
+                self.show_dual_liquid_result(results, usable=True, reason="No water detected")
+                
+        except Exception as e:
+            self.add_progress_log(f"Dual liquid analysis failed: {e}")
+            messagebox.showerror("Error", f"Dual liquid analysis failed: {e}")
+
+    def create_middle_third_mask(self):
+        """Create a mask for the middle 1/3 of the current segmentation"""
+        # Use original segmentation mask if available, otherwise use current one
+        if hasattr(self, 'original_segmentation_mask') and self.original_segmentation_mask is not None:
+            source_mask = self.original_segmentation_mask
+        elif self.segmentation_mask is not None:
+            source_mask = self.segmentation_mask
+        else:
+            return
+            
+        # Get bounding box of source mask
+        rows = np.any(source_mask, axis=1)
+        cols = np.any(source_mask, axis=0)
+        
+        if not np.any(rows) or not np.any(cols):
+            return
+            
+        y_min, y_max = np.where(rows)[0][[0, -1]]
+        height = y_max - y_min
+        
+        # Calculate middle 1/3 vertical range
+        new_y_min = int(y_min + height / 3)
+        new_y_max = int(y_min + 2 * height / 3)
+        
+        # Create new mask from source
+        new_mask = np.zeros_like(source_mask)
+        new_mask[new_y_min:new_y_max, :] = source_mask[new_y_min:new_y_max, :]
+        
+        self.segmentation_mask = new_mask
+        
+        # Update bbox
+        rows_new = np.any(new_mask, axis=1)
+        cols_new = np.any(new_mask, axis=0)
+        if np.any(rows_new) and np.any(cols_new):
+            ny_min, ny_max = np.where(rows_new)[0][[0, -1]]
+            nx_min, nx_max = np.where(cols_new)[0][[0, -1]]
+            self.bbox_coords = (nx_min, ny_min, nx_max, ny_max)
+
+    def create_cluster_middle_third_mask(self, cluster_name):
+        """Create a middle 1/3 mask for a specific cluster"""
+        if cluster_name not in self.current_clusters:
+            return
+            
+        cluster_mask = self.current_clusters[cluster_name]['mask']
+        if cluster_mask is None:
+            return
+            
+        # Get bounding box of cluster mask
+        rows = np.any(cluster_mask, axis=1)
+        cols = np.any(cluster_mask, axis=0)
+        
+        if not np.any(rows) or not np.any(cols):
+            return
+            
+        y_min, y_max = np.where(rows)[0][[0, -1]]
+        height = y_max - y_min
+        
+        # Calculate middle 1/3 vertical range
+        new_y_min = int(y_min + height / 3)
+        new_y_max = int(y_min + 2 * height / 3)
+        
+        # Create new mask
+        new_mask = np.zeros_like(cluster_mask)
+        new_mask[new_y_min:new_y_max, :] = cluster_mask[new_y_min:new_y_max, :]
+        
+        # Update current segmentation mask to this cluster's middle third
+        self.segmentation_mask = new_mask
+        
+        # Update bbox
+        rows_new = np.any(new_mask, axis=1)
+        cols_new = np.any(new_mask, axis=0)
+        if np.any(rows_new) and np.any(cols_new):
+            ny_min, ny_max = np.where(rows_new)[0][[0, -1]]
+            nx_min, nx_max = np.where(cols_new)[0][[0, -1]]
+            self.bbox_coords = (nx_min, ny_min, nx_max, ny_max)
+
+    def get_masked_roi(self):
+        """Get the masked ROI for RGB analysis"""
+        if self.current_frame is None or self.segmentation_mask is None:
+            return None
+        return self.current_frame
+
+    def extract_features(self):
+        """Extract features for classification"""
+        if self.current_frame is None or self.segmentation_mask is None: 
+            return None
+        try:
+            if self.camera_available:
+                frames = self.pipeline.wait_for_frames(timeout_ms=100)
+                ir = np.asanyarray(frames.get_infrared_frame().get_data())
+                if ROTATE_PREVIEW: ir = cv2.rotate(ir, ROTATE_DIR)
+            else: 
+                ir = np.ones(self.current_frame.shape[:2], dtype=np.uint8) * 150
+
+            # Get bounding box
+            rows = np.any(self.segmentation_mask, axis=1)
+            cols = np.any(self.segmentation_mask, axis=0)
+            if not np.any(rows) or not np.any(cols):
+                return None
+            
+            y_min, y_max = np.where(rows)[0][[0, -1]]
+            x_min, x_max = np.where(cols)[0][[0, -1]]
+            self.bbox_coords = (x_min, y_min, x_max, y_max)
 
             x1, y1, x2, y2 = self.bbox_coords
             roi_col = self.current_frame[y1:y2, x1:x2]
             roi_ir = ir[y1:y2, x1:x2]
             
             mask = np.zeros(self.current_frame.shape[:2], dtype=np.uint8)
-            if self.polygon_coords:
-                pts = np.array(self.polygon_coords, np.int32).reshape((-1, 1, 2))
-                cv2.fillPoly(mask, [pts], 255)
-            else: mask[y1:y2, x1:x2] = 255
+            mask[y1:y2, x1:x2] = 255
             mask_roi = mask[y1:y2, x1:x2]
             roi_bgr = cv2.cvtColor(roi_col, cv2.COLOR_RGB2BGR)
 
-            # --- CUSTOM SCORES ---
-            self.current_yellow_score = self.calculate_yellow_score(roi_col, mask_roi)
-            self.current_black_score = self.calculate_black_score(roi_col, mask_roi) # [NEW]
-
-            # --- STANDARD FEATURES ---
+            # Standard features
             feats = []
             mean_bgr = cv2.mean(roi_bgr)[:3]
             feats.append(mean_bgr[2]) # R
@@ -622,85 +1253,57 @@ class OilClassificationGUI:
             print(f"Feature error: {e}")
             return None
 
-    def classify_by_ir_cluster(self, ir_value):
-        dists = {k: abs(ir_value - v) for k, v in self.ir_thresholds.items()}
-        pred = min(dists, key=dists.get)
-        return {'class': pred, 'distance': dists[pred], 'distances': dists, 
-                'usable': pred in {'Light oil', 'Medium oil', 'Dark oil'},
-                'ir_value': ir_value, 'threshold': self.ir_thresholds[pred]}
-
-    def classify_nearest_centroid(self):
-        pt = self.pca_values
-        dists = {k: np.linalg.norm(pt - v) for k, v in self.centroids.items()}
-        pred = min(dists, key=dists.get)
-        return {'class': pred, 'distance': dists[pred], 'distances': dists, 
-                'usable': pred in self.usable_classes}
-
-    def update_pca_display(self):
-        v = self.pca_values
-        self.pc1_label.config(text=f"PC1: {v[0]:+.3f}")
-        self.pc2_label.config(text=f"PC2: {v[1]:+.3f}")
-        self.pc3_label.config(text=f"PC3: {v[2]:+.3f}")
-
-    def update_result_display(self):
-        res = self.classification_result
-        self.result_label.config(text=f"Oil Type: {res['class']}")
+    def show_dual_liquid_result(self, results, usable, reason):
+        """Display results for dual liquid analysis"""
+        cluster_0_result = results['cluster_0']
+        cluster_1_result = results['cluster_1']
         
-        bg = "#C8E6C9" if res['usable'] else "#FFCDD2"
-        self.usability_label.config(text="USABLE OIL" if res['usable'] else "UNUSABLE OIL", background=bg)
-        self.confidence_label.config(text=f"Confidence: {100*np.exp(-res['distance']):.1f}%")
-
-        self.info_text.delete(1.0, tk.END)
-        self.info_text.insert(tk.END, "=== Classification Details ===\n\n")
-        self.info_text.insert(tk.END, f"Class: {res['class']}\n")
+        result_text = f"Cluster 0: {cluster_0_result['class']}\nCluster 1: {cluster_1_result['class']}"
+        self.result_label.config(text=result_text)
         
-        # [NEW] Display Yellow AND Black scores
-        self.info_text.insert(tk.END, f"Yellow Score: {self.current_yellow_score:.2f} (Max 255)\n")
-        self.info_text.insert(tk.END, f"Black Score : {self.current_black_score:.2f} (Max 255)\n")
-        self.info_text.insert(tk.END, f"---------------------------\n")
-
-        if self.classification_method.get() == "ir":
-            self.info_text.insert(tk.END, f"IR Value: {res['ir_value']:.2f}\nDiff: {res['distance']:.2f}\n\n")
-            sorted_d = sorted(res['distances'].items(), key=lambda x: x[1])
-            for k, v in sorted_d:
-                m = " <--" if k == res['class'] else ""
-                self.info_text.insert(tk.END, f"{k:15s}: {v:6.2f}{m}\n")
-        else:
-            self.info_text.insert(tk.END, f"Dist: {res['distance']:.3f}\n\n")
-            sorted_d = sorted(res['distances'].items(), key=lambda x: x[1])
-            for k, v in sorted_d:
-                m = " <--" if k == res['class'] else ""
-                self.info_text.insert(tk.END, f"{k:15s}: {v:6.3f}{m}\n")
-                
-        self.info_text.insert(tk.END, f"\n=== Features ===\n")
-        for n, v in zip(self.feature_columns, self.features):
-            self.info_text.insert(tk.END, f"{n:15s}: {v:8.3f}\n")
-
-    def load_image(self):
-        fn = filedialog.askopenfilename()
-        if fn:
-            img = cv2.imread(fn)
-            self.current_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            self.display_image(self.current_frame)
-            self.segmentation_mask = None
-            self.update_status(f"Loaded: {fn}")
-
-    def take_snapshot(self):
-        if self.current_frame is not None:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            cv2.imwrite(f"snapshot_{ts}.jpg", cv2.cvtColor(self.current_frame, cv2.COLOR_RGB2BGR))
-            self.update_status(f"Saved snapshot_{ts}.jpg")
-
-    def update_status(self, msg):
-        self.status_label.config(text=msg)
-        self.root.update_idletasks()
-
-    def cleanup(self):
-        if self.camera_available: self.pipeline.stop()
+        bg_color = "#C8E6C9" if usable else "#FFCDD2"
+        status_text = "USABLE" if usable else "UNUSABLE"
+        self.usability_label.config(text=f"{status_text} - {reason}", background=bg_color)
+        
+        # Display distance analysis for both clusters
+        self.distances_text.delete(1.0, tk.END)
+        self.distances_text.insert(tk.END, "=== DUAL LIQUID DISTANCES ===\n")
+        
+        for cluster_name, result in results.items():
+            self.distances_text.insert(tk.END, f"\n{cluster_name.upper()}:\n")
+            self.distances_text.insert(tk.END, f"  Type: {result['class']}\n")
+            self.distances_text.insert(tk.END, f"  Confidence: {result['confidence']:.3f}\n")
+            self.distances_text.insert(tk.END, f"  Distance: {result['total_distance']:.4f}\n")
+        
+        self.details_text.delete(1.0, tk.END)
+        self.details_text.insert(tk.END, "=== ENHANCED DUAL LIQUID ANALYSIS ===\n\n")
+        
+        for cluster_name, result in results.items():
+            area = self.current_clusters[cluster_name]['area']
+            self.details_text.insert(tk.END, f"{cluster_name.upper()}:\n")
+            self.details_text.insert(tk.END, f"  Type: {result['class']}\n")
+            self.details_text.insert(tk.END, f"  Confidence: {result['confidence']:.3f}\n")
+            self.details_text.insert(tk.END, f"  Pixels: {area}\n")
+            self.details_text.insert(tk.END, f"  IR: {result['ir_value']:.2f}\n")
+            self.details_text.insert(tk.END, f"  Yellow: {result['yellow_score']:.2f}\n")
+            self.details_text.insert(tk.END, f"  Black: {result['black_score']:.2f}\n")
+            
+            # Show thresholds and distances
+            thresh = result['thresholds']
+            comp_dist = result['component_distances']
+            self.details_text.insert(tk.END, f"  Thresholds: IR={thresh['ir']:.1f}, Y={thresh['yellow']:.1f}, B={thresh['black']:.1f}\n")
+            self.details_text.insert(tk.END, f"  Distances: IR={comp_dist['ir']:.2f}, Y={comp_dist['yellow']:.2f}, B={comp_dist['black']:.2f}\n\n")
+        
+        self.details_text.insert(tk.END, f"Final Status: {status_text}\n")
+        self.details_text.insert(tk.END, f"Reason: {reason}\n")
+        
+        self.automation_state = AutomationState.ANALYSIS_COMPLETE
+        self.action_button.config(text="🔄 Reset Analysis")
+        self.step_label.config(text="Analysis Complete")
 
 def main():
     root = tk.Tk()
-    app = OilClassificationGUI(root)
+    app = OilClassificationEnhancedGUI(root)
     root.protocol("WM_DELETE_WINDOW", lambda: (app.cleanup(), root.destroy()))
     root.mainloop()
 
